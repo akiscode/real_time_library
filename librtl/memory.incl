@@ -1,0 +1,1208 @@
+
+// Copyright (c) 2023. Akiscode
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <assert.h>
+#include <stdint.h>
+
+#include "rtl/pounds.h"
+
+#ifndef IMPL_RTL_MEMORY_TEST
+#include "rtl/memory.h"
+#else
+#include "stddef.h"
+#endif
+
+#ifndef RTL_TARGET_WORD_SIZE_BITS
+#error \
+    "Please define RTL_TARGET_WORD_SIZE_BITS (the word size of your **TARGET** platform in bits) to compile this library"
+#endif
+
+#define RTL_WORD_SIZE_BYTES (RTL_TARGET_WORD_SIZE_BITS / 8)
+#if RTL_WORD_SIZE_BYTES == 2
+
+#error "RTL can not support a word size of 16 bits/2 bytes"
+
+#elif RTL_WORD_SIZE_BYTES == 4
+
+// 2^2 == 4
+#define RTL_WORD_SIZE_BYTES_LOG2 2
+
+#elif RTL_WORD_SIZE_BYTES == 8
+
+// 2^3 = 8
+#define RTL_WORD_SIZE_BYTES_LOG2 3
+
+#else
+
+#ifndef RTL_WORD_SIZE_BYTES_LOG2
+#error "Please define RTL_WORD_SIZE_BYTES_LOG2 manually"
+#endif
+
+#endif
+
+// An unsigned integer that is exactly RTL_TARGET_WORD_SIZE_BITS long
+#define RTL_UWORD RTL_CONCAT(uint, RTL_CONCAT(RTL_TARGET_WORD_SIZE_BITS, _t))
+
+RTL_C_STATIC_ASSERT((RTL_TARGET_WORD_SIZE_BITS % 8) == 0, word_size_modulo_);
+
+struct alignment_struct {
+  char c;
+  union {
+    intmax_t imax;
+    long double ldbl;
+    void *vptr;
+    void (*fptr)(void);
+  } u;
+};
+
+static struct alignment_struct alignment_data;
+static const size_t ALIGNMENT_REQUIREMENT =
+    (char *)(&alignment_data.u.imax) - (char *)&alignment_data.c;
+
+#define NEXT_BLK(blk) \
+  ((tlsf_blk_hdr *)((unsigned char *)(blk) + blk_get_size(blk)))
+
+static const int8_t debruijn_fls[32] = {
+    0, 9,  1,  10, 13, 21, 2,  29, 11, 14, 16, 18, 22, 25, 3, 30,
+    8, 12, 20, 28, 15, 17, 24, 7,  19, 27, 23, 6,  26, 5,  4, 31};
+
+static const int8_t debruijn_ffs[32] = {
+    0,  1,  28, 2,  29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4,  8,
+    31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6,  11, 5,  10, 9};
+
+/*! \brief rtl_fls32 Returns the position of the last bit (starting from least
+ * significant bit) set to 1
+ *
+ * Note that this function will return from 0..31 (inclusive).
+ *
+ * Values are indexed starting from the LSB (i.e. MSB is 31 and LSB is 0)
+ *
+ * Supplying a value of 0 will return 0
+ *
+ * \param x the value to inspect
+ * \return the position index
+ */
+static inline int8_t rtl_fls32(uint32_t x) {
+  x = x | (x >> 1);
+  x = x | (x >> 2);
+  x = x | (x >> 4);
+  x = x | (x >> 8);
+  x = x | (x >> 16);
+
+  return debruijn_fls[(uint32_t)(x * 0x07C4ACDDU) >> 27];
+}
+
+/*! \brief rtl_ffs32 Returns the position of the first bit (starting from least
+ * significant bit) set to 1
+ *
+ * Note that this function will return from 0...31 (inclusive).
+ *
+ * Values are indexed starting from the LSB (i.e. MSB is 31 and LSB is 0)
+ *
+ * Supply a value of 0 will return 0
+ *
+ * \param x the value to inspect
+ * \return the position index
+ */
+static inline int8_t rtl_ffs32(uint32_t x) {
+  return debruijn_ffs[((uint32_t)((x & ((int32_t)0 - x)) * 0x077CB531U)) >> 27];
+}
+
+/*!
+ * \brief rtl_fls64 Returns the position of the last bit (starting from least
+ * significant bit) set to 1
+ *
+ * Note that this function will return from 0..63 (inclusive).
+ *
+ * Values are indexed starting from the LSB (i.e. MSB is 31 and LSB is 0)
+ *
+ * Supplying a value of 0 will return 0
+ *
+ * \param x the value to inspect
+ * \return the position index
+ */
+int8_t rtl_fls64(uint64_t x) {
+  if (x == 0U) {
+    return 0;
+  }
+
+  uint32_t high = (uint32_t)(x >> 32);
+  int8_t rval;
+
+  // High isn't zero, we should find something there
+  if (high != 0U) {
+    rval = 32 + rtl_fls32(high);
+  } else {
+    // Else there has to be a one in the lower half
+    uint32_t low = (uint32_t)(x & 0xFFFFFFFFU);
+    rval = rtl_fls32(low);
+  }
+
+  return rval;
+}
+
+/*!
+ * \brief rtl_ffs64 Returns the position of the most significant bit set to 1
+ *
+ * Note that this function will return from 0...63 (inclusive).
+ *
+ * Values are indexed starting from the LSB (i.e. MSB is 31 and LSB is 0)
+ *
+ * Supply a value of 0 will return 0
+ *
+ * \param x the value to inspect
+ * \return the position index
+ */
+int8_t rtl_ffs64(uint64_t x) {
+  if (x == 0U) {
+    return 0;
+  }
+
+  uint32_t low = (uint32_t)(x & 0xFFFFFFFFU);
+  int8_t rval;
+
+  // Low isn't zero, we should find something there
+  if (low != 0U) {
+    rval = rtl_ffs32(low);
+  } else {
+    // Low wasn't there, find something in high
+    uint32_t high = (uint32_t)(x >> 32U);
+    rval = 32 + rtl_ffs32(high);
+  }
+
+  return rval;
+}
+
+//! Returns true if size is safe to cast to RTL_UWORD
+static int safe_to_cast_to_rtl_uword(size_t size) {
+  // If the size of the RTL UWORD is bigger, than it is fine
+  if (sizeof(RTL_UWORD) >= sizeof(size_t)) {
+    return 1;
+  }
+
+  // Unsigned int will wrap around to INT_MAX
+  RTL_UWORD limit = -1;
+
+  // Remember that size_t is bigger
+  size_t limit_sz = (size_t)limit;
+
+  if (size > limit_sz) {
+    return 0;
+  }
+
+  return 1;
+}
+
+/*
+ *  We use an enum instead of #define's because want
+ *  the bit shifts to be evaluated to a literal value
+ *  at compile time
+ */
+enum tlsf_variables {
+
+  /*
+   * In the size variable in tlsf_block_header, we use the two least
+   * significant bits to help us determine two pieces of information:
+   *
+   * FREE_BIT_POSITION: The bit that determines if the block is busy
+   * or free
+   *
+   * LAST_BLOCK_BIT_POSITION: The bit that determines if the block is
+   * the last block in the pool
+   *
+   */
+  BLK_HDR_FREE_BIT = ((RTL_UWORD)0x1),
+  BLK_HDR_LAST_BLOCK_BIT = ((RTL_UWORD)0x2),
+  BLK_HDR_META_BITS = ((RTL_UWORD)((RTL_UWORD)BLK_HDR_FREE_BIT |
+                                   (RTL_UWORD)BLK_HDR_LAST_BLOCK_BIT)),
+
+  /*
+   * When raised to the power of two, this is the maximum
+   * number of subdivisions for each FL index.
+   *
+   * A value of 4 or 5 here is appropriate according to the
+   * specification.  The higher the number, the less fragmentation
+   * there is.
+   *
+   * Note that we want to make sure that we can fit 2^SLI_COUNT_LOG2
+   * bits in our RTL_UWORD because it will be a bitmap integer. And
+   * we need to map 16 bits within it.
+   *
+   */
+
+  SLI_COUNT_LOG2 = 5,
+  SLI_COUNT = ((RTL_UWORD)1 << (RTL_UWORD)SLI_COUNT_LOG2),
+
+  /*
+   * Because our boundary tags (aka our size variables)
+   * have the least two significant bits set, we can never have
+   * our allocations sized to anything other than a multiple of 4.
+   *
+   */
+  WORD_SIZE_BYTES = RTL_WORD_SIZE_BYTES,
+  WORD_SIZE_BYTES_LOG2 = RTL_WORD_SIZE_BYTES_LOG2,
+
+  /*
+   * Why WORD_SIZE_BITS - 2?
+   *
+   * Well 2^WORD_SIZE_BITS would overflow
+   * on UWORD so we can't actually index against WORD_SIZE_BITS.
+   *
+   * So why not WORD_SIZE_BITS - 1?  Although that would technically
+   * be within the addressable space of UWORD we run into problems
+   * because we wouldn't be able to do pointer arithmetic on sizes
+   * strictly greater than (2^(WORD_SIZE_BITS - 1)) / 2.  This is
+   * because the ptrdiff_t type on some platforms may be the same
+   * width as UWORD.  The C standard also mandates that ptrdiff is signed.
+   *
+   * So we are actually capped at allocating at PTRDIFF_MAX
+   * aka (2^(WORD_SIZE_BITS - 1)) / 2 == 2^(WORD_SIZE_BITS-2)
+   *
+   * We define MAXIMUM_BLOCK_SIZE later because the C standard
+   * only guarantees that the size of an enum to be an int and
+   * 2^MAXIMUM_FLI could potentially be larger than what an int
+   * could hold.
+   *
+   * All FLI's found should be strictly less (i.e. < not <=) than
+   * MAXIMUM_FLI
+   *
+   */
+  MAXIMUM_FLI = (RTL_TARGET_WORD_SIZE_BITS - 2),
+
+  /*
+   * One of our core assumptions is that the size field will always be a
+   * multiple of WORD_SIZE_BYTES.  The reason being is that we use (0x1 | 0x2)
+   * (the two least significant bits) to indicate meta data.  If a
+   * non-WORD_SIZE_BYTES multiple (like say 3 or 6) would be available, then
+   * those fields would get "clobbered" and we would lose information.
+   *
+   * To do this we have to ensure that the secondary level spacing is always
+   * above WORD_SIZE_BYTES.  In other words:
+   *
+   * 2^(MINIMUM_FLI-SLI_COUNT_LOG2) = WORD_SIZE_BYTES
+   * MINIMUM_FLI - SLI_COUNT_LOG2 = WORD_SIZE_BYTES_LOG2
+   *
+   * MINIMUM_FLI = WORD_SIZE_BYTES_LOG2 + SLI_COUNT_LOG2
+   *
+   * On 32 bit processors: MINIMUM_FLI = 7
+   * On 64 bit processors: MINIMUM_FLI = 8
+   *
+   * All FLI's found should be greater than or equal to (i.e. >= not >)
+   * than MINIMUM_FLI.  The only exception is when we go to allocations
+   * that are less than the MINIMIUM_FLI_ALLOCATION. These allocations
+   * are stored in a seperate row MINIMUM_FLI-1.
+   *
+   */
+  MINIMUM_FLI = WORD_SIZE_BYTES_LOG2 + SLI_COUNT_LOG2,
+
+  /*
+   * If the smallest FLI level we can go is MINIMUM_FLI,
+   * then the smallest size we can go is 2^MINIMUM_FLI
+   *
+   * If we get allocations below that we are going to
+   * create a linear spacing from 0 to MINIMUM_FLI_ALLOCATION-WORD_SIZE_BYTES
+   * (inclusive) in spacing of MINIMUM_FLI_ALLOCATION/SLI_COUNT.
+   *
+   * The reason we do this is that below MINIMUM_FLI the spacing
+   * between secondary level indexes is less than WORD_SIZE_BYTES.  So we
+   * instead create a vector of size SLI_COUNT with the appropriate spacing to
+   * place these requests in.
+   *
+   */
+  MINIMUM_FLI_ALLOCATION = ((RTL_UWORD)1 << MINIMUM_FLI),
+
+  /*
+   * The total number of first level indexes is the maximum
+   * minus the minimum plus one.
+   *
+   * This number lets us understand that:
+   * 	- The MAXIMUM_FLI should never be "reached" only be strictly less than
+   * 	- We add an additional row for the first level under the MINIMUM_FLI
+   *
+   */
+  FLI_COUNT = (MAXIMUM_FLI - MINIMUM_FLI + 1),
+
+  /*
+   *
+   * With our functions we will get a value (FLI) between MINIMUM_FLI and
+   * MAXIMUM_FLI.
+   *
+   * But if we have a array of length FLI_COUNT, how do we map from the previous
+   * FLI to our array?  We can use the following:
+   *
+   * FLI_ARRAY_INDEX = FLI - FLI_SHIFT_VAL
+   *
+   * Here's an example:
+   * MAXIMUM_FLI = 14
+   * MINIMUM_FLI = 6
+   *
+   * FLI_COUNT = 9
+   * FLI_SHIFT_VAL = 5
+   *
+   *
+   * FL_ARRAY := array(FLI_COUNT)
+   *   -> INDEX    [ 0 1 2 3 4 5  6  7  8  ]
+   *   -> FL Value [ 5 6 7 8 9 10 11 12 13 ]
+   *
+   * FLI = 8 // MINIMUM_FLI-1 <= 8 < 14
+   *
+   * FL_ARRAY[8-FLI_SHIFT_VAL] == FL_ARRAY[3]
+   *
+   */
+  FLI_SHIFT_VAL = MINIMUM_FLI - 1,
+
+};
+
+// ---- BEGIN SANITY CHECKS ----
+
+// Make sure defines are set right.
+RTL_C_STATIC_ASSERT((RTL_UWORD)WORD_SIZE_BYTES ==
+                        ((RTL_UWORD)1 << (RTL_UWORD)WORD_SIZE_BYTES_LOG2),
+                    word_size_bytes_);
+
+RTL_C_STATIC_ASSERT((RTL_UWORD)WORD_SIZE_BYTES ==
+                        (RTL_UWORD)MINIMUM_FLI_ALLOCATION /
+                            (RTL_UWORD)SLI_COUNT,
+                    align_to_multi_);
+
+// Make sure that the number of bits in our word is bigger than the count
+// parameter We need to do this because RTL_UWORD will be a bitmap
+RTL_C_STATIC_ASSERT(sizeof(RTL_UWORD) * 8 >= (RTL_UWORD)SLI_COUNT,
+                    size_of_rtl_uword_);
+
+// Make sure that the RTL_UWORD can be used to hold the maximum allocation
+// (2^MAXIMUM_FLI)
+RTL_C_STATIC_ASSERT(sizeof(RTL_UWORD) * 8 >= (RTL_UWORD)MAXIMUM_FLI,
+                    size_of_rtl_uword_2_);
+
+RTL_C_STATIC_ASSERT((RTL_UWORD)BLK_HDR_META_BITS == 0x3, meta_bits_);
+
+RTL_C_STATIC_ASSERT((123 & ~((RTL_UWORD)BLK_HDR_META_BITS)) == 120,
+                    meta_bits_2_);
+
+// ---- END SANITY CHECKS ----
+
+// Cut down on the parenthesis hell
+#define CAST(to, from) ((to)(from))
+
+#if RTL_WORD_SIZE_BYTES == 8
+
+#define FLS(x) rtl_fls64(x)
+#define FFS(x) rtl_ffs64(x)
+
+#else
+
+#define FLS(x) rtl_fls32(x)
+#define FFS(x) rtl_ffs32(x)
+
+#endif
+
+/*!
+ * \brief mapping_insert modifies the out variables with the appropriate values
+ * given a request size
+ *
+ * The request size (the request param) should be a variable sized to align with
+ * the WORD_SIZE_BYTES value.  The parameter represents the request size in
+ * bytes
+ *
+ * \param request the size of the memory request in bytes
+ * \param out_fli the first level index
+ * \param out_sli the second level index
+ */
+static void mapping_insert(RTL_UWORD request, RTL_UWORD *out_fli,
+                           RTL_UWORD *out_sli) {
+  // Remember: If we are below a certain FLI value, we are going to store
+  // the values in a single vector spaced by our alignment
+  if (request < MINIMUM_FLI_ALLOCATION) {
+    *out_fli = MINIMUM_FLI - 1;
+    *out_sli = request / WORD_SIZE_BYTES;
+  } else {
+    // Otherwise just do our "normal" calculation
+    *out_fli = FLS(request);
+    *out_sli = (request >> (*out_fli - SLI_COUNT_LOG2)) - SLI_COUNT;
+  }
+}
+
+/*!
+ * \brief mapping_search similar to mapping_insert except request is rounded
+ * first
+ *
+ * This function "rounds" the request so that the fli/sli indexes are "one up"
+ * from the proper indexes.
+ *
+ * The request size (the request param) should be a variable sized to align with
+ * the WORD_SIZE_BYTES value.  The parameter represents the request size in
+ * bytes
+ *
+ * As an example:
+ *
+ * Lets say that our request is normally 516 bytes.  In this example, that would
+ * produce a FLI of 9 and a SLI of 0.  But because we want to ensure we have
+ * constant time access to a block of at least 516 bytes, we actually go to the
+ * next interval since all of them are going to be able to satisfy this.  So
+ * calling this function with a request of 516 bytes will actually return a FLI
+ * of 9 and a SLI of 1
+ *
+ * \param request the request to be rounded in bytes.
+ * \param out_fli the first level index
+ * \param out_sli the second level index
+ */
+static void mapping_search(RTL_UWORD request, RTL_UWORD *out_fli,
+                           RTL_UWORD *out_sli) {
+  if (request >= MINIMUM_FLI_ALLOCATION) {
+    // We only want to "round up" the fli and sli when we are above our vector
+    // level.  Remember that our bottom vector is spaced by WORD_SIZE_BYTES so
+    // every request below this allocation level will be perfectly matched.
+
+    request = request + (1 << (FLS(request) - (RTL_UWORD)SLI_COUNT_LOG2)) - 1U;
+  }
+
+  mapping_insert(request, out_fli, out_sli);
+}
+
+/*
+ * Represents the meta data attached with each allocation.  The structure
+ * shown below has a dual nature depending on whether the block is free or
+ * busy.
+ *
+ * The "size" and "prev_physical_block" members are always present whether
+ * the block is in a free list or busy.
+ *
+ * The size variable represents the total number of bytes of the allocation
+ * _INCLUDING_ the size of the header.  In other words, if you had a pointer
+ * to the size variable and added the value of size to that pointer, you would
+ * reach the next block.
+ *
+ * The two least significant bits are not used for the size itself and instead
+ * are used to provide compact "flags".
+ *
+ * The bit at 0x2 indicates whether this block is the last physical block
+ * allocated.  A value of 1 means that this is the last physical block.  A value
+ * of 0 means that it isn't.  You may only advance to the next physical block
+ * (by doing the pointer arithmetic mentioned before) if this bit is 0. This bit
+ * is only modified by the split and merge functions.
+ *
+ * The bit at 0x1 indicates whether this block is in a free list or not.  A
+ * value of 1 indicates that it is free.  A value of 0 indicates that it is in
+ * use. If the value is 0, then the pointers represnted by next_free and
+ * prev_free are not valid.  Only if the value is 1 are these pointers valid
+ * pointers.
+ *
+ * We can use the two least significant bits because we always adjust the size
+ * of the requests in a way that these two bits aren't touched.
+ *
+ * prev_physical_block is a pointer to the previous physical block allocation.
+ * If this is NULL then there are no more physical blocks before this one.  This
+ * is only modified by the split and merge functions.
+ *
+ * next_free and prev_free are pointers which point to the next and previous
+ * blocks in the segregated free lists (respectively).  They are only valid when
+ * the block is free otherwise they undefined values.  The split and merge
+ * functions DON'T touch these.  Instead, the insert and remove block functions
+ * do.  These values may be NULL, indicating that there is nothing past this
+ * block in that "direction".
+ *
+ * The size of this struct represents the smallest allocation that will be
+ * managed by the allocator.
+ *
+ */
+typedef struct tlsf_blk_hdr {
+  // Size of the complete header and allocation.
+  // 0x2 -> Last Physical block or not (1 == True)
+  // 0x1 -> Free or Not (1 == Free)
+  RTL_UWORD size;
+  struct tlsf_blk_hdr *prev_physical_block;
+
+  // --- After this point, only valid if free block
+
+  struct tlsf_blk_hdr *next_free;
+  struct tlsf_blk_hdr *prev_free;
+
+} tlsf_blk_hdr;
+
+// Included outside the enum because enums aren't guaranteed to hold the size
+static const RTL_UWORD MAXIMUM_BLOCK_SIZE = (CAST(RTL_UWORD, 1) << MAXIMUM_FLI);
+
+// The minimum block size we can allocate is the size of a block header.
+static const RTL_UWORD MINIMUM_BLOCK_SIZE = sizeof(tlsf_blk_hdr);
+
+// If we start at the base of a block header, how many bytes until we can start
+// writing user data.  It is after the prev_physical_block pointer, which
+// is why we add the sizeof(struct tlsf_blk_hdr*) addition
+static const RTL_UWORD START_OF_USER_DATA_OFFSET =
+    offsetof(tlsf_blk_hdr, prev_physical_block) + sizeof(struct tlsf_blk_hdr *);
+
+static inline RTL_UWORD blk_get_size(const tlsf_blk_hdr *blk_hdr) {
+  // Remember we need to "null out" the 2 least significant bits
+  return blk_hdr->size & ~((RTL_UWORD)BLK_HDR_META_BITS);
+}
+
+static inline void blk_set_size(tlsf_blk_hdr *blk_hdr, RTL_UWORD size) {
+  RTL_UWORD prev = blk_hdr->size;
+  RTL_UWORD prev_bits = prev & (RTL_UWORD)BLK_HDR_META_BITS;
+  blk_hdr->size = size | prev_bits;
+}
+
+static inline unsigned int blk_is_free(const tlsf_blk_hdr *blk_hdr) {
+  return blk_hdr->size & (unsigned int)BLK_HDR_FREE_BIT;
+}
+
+static inline void blk_set_free(tlsf_blk_hdr *blk_hdr) {
+  blk_hdr->size |= (RTL_UWORD)BLK_HDR_FREE_BIT;
+}
+
+static inline void blk_set_busy(tlsf_blk_hdr *blk_hdr) {
+  blk_hdr->size &= ~(RTL_UWORD)BLK_HDR_FREE_BIT;
+}
+
+static inline unsigned int blk_is_last(const tlsf_blk_hdr *blk_hdr) {
+  return blk_hdr->size & (unsigned int)BLK_HDR_LAST_BLOCK_BIT;
+}
+
+static inline void blk_set_last(tlsf_blk_hdr *blk_hdr) {
+  blk_hdr->size |= (RTL_UWORD)BLK_HDR_LAST_BLOCK_BIT;
+}
+
+static inline void blk_set_not_last(tlsf_blk_hdr *blk_hdr) {
+  blk_hdr->size &= ~((RTL_UWORD)BLK_HDR_LAST_BLOCK_BIT);
+}
+
+static inline void *blk_hdr_to_ptr(tlsf_blk_hdr *blk_hdr) {
+  unsigned char *ptr = CAST(unsigned char *, blk_hdr);
+
+  ptr += START_OF_USER_DATA_OFFSET;
+
+  return CAST(void *, ptr);
+}
+
+static inline tlsf_blk_hdr *ptr_to_blk_hdr(const void *mem) {
+  unsigned char *ptr = CAST(unsigned char *, mem);
+
+  ptr -= START_OF_USER_DATA_OFFSET;
+
+  return CAST(tlsf_blk_hdr *, ptr);
+}
+
+/*
+ * Represents the overall allocation meta-data.
+ *
+ * The fl bitmap serves as a first level bitmap. The most significant bit of the
+ * fl_bitmap represents the highest first level index.  Taking the FLS of
+ * the fl_bitmap shows us which index we go to the sl_bitmap.
+ *
+ * The formulas to find your fl and sl are:
+ *
+ * fl = FLS(request)
+ * sl = (request >> (fl - SLI_COUNT_LOG2)) - SLI_COUNT
+ *
+ * free_blocks is a multi-dimensional array that contains linked lists of
+ * blocks in a similar category.  The linked list is managed via the
+ * prev_free and next_free pointers.
+ *
+ */
+struct rtl_tlsf_arena {
+  // Bits of 1 mean there are free blocks.  Bits of 0 mean there are none.
+  RTL_UWORD fl_bitmap;
+  RTL_UWORD sl_bitmap[FLI_COUNT];
+
+  tlsf_blk_hdr *free_blocks[FLI_COUNT][SLI_COUNT];
+};
+
+/*!
+ * \brief tlsf_arena_insert_block insert a block into the appropriate free list
+ *
+ * This function will take the block pointed to, find the appropriate index
+ * and "insert" it into the list.
+ *
+ * This function needs the block size appropriately set.
+ *
+ * This function will set the free bit to true.
+ *
+ * This function will properly set the following:
+ * - Next Free Pointer
+ * - Prev Free Pointer
+ *
+ * It will NOT set the previous physical block pointer or the is last bit
+ *
+ * \param arena the memory arena
+ * \param blk_hdr pointer to the block to insert
+ */
+static void tlsf_arena_insert_block(struct rtl_tlsf_arena *arena,
+                                    tlsf_blk_hdr *blk_hdr) {
+  RTL_UWORD fli, sli, blk_size;
+  tlsf_blk_hdr *head_blk_hdr;
+
+  blk_size = blk_get_size(blk_hdr);
+
+  blk_set_free(blk_hdr);
+
+  // Mapping insert doesn't "round", we simply find the true location
+  // to place this block.  The fli and sli variables will be modified.
+  mapping_insert(blk_size, &fli, &sli);
+
+  head_blk_hdr = arena->free_blocks[fli - FLI_SHIFT_VAL][sli];
+
+  if (head_blk_hdr == NULL) {
+    // The entry is NULL, so that means we are the "first" entry
+    blk_hdr->next_free = NULL;
+    blk_hdr->prev_free = NULL;
+
+  } else {
+    // There is an entry here.  Lets insert it.
+
+    blk_hdr->prev_free = NULL;
+    blk_hdr->next_free = head_blk_hdr;
+
+    head_blk_hdr->prev_free = blk_hdr;
+  }
+
+  arena->free_blocks[fli - FLI_SHIFT_VAL][sli] = blk_hdr;
+
+  // Finally, lets set he bitmaps appropriately
+
+  arena->sl_bitmap[fli - FLI_SHIFT_VAL] |= (CAST(RTL_UWORD, 1) << sli);
+  arena->fl_bitmap |= (CAST(RTL_UWORD, 1) << fli);
+}
+
+/*!
+ * \brief remove_block removes the block from the free list of the arena
+ *
+ * This function assumes that this is a valid block that is residing in one
+ * of the free lists.
+ *
+ * This function will set the busy bit appropriately.
+ *
+ * This function will properly set the following:
+ * - Next Free Pointer
+ * - Prev Free Pointer
+ *
+ * It will NOT set the previous physical block pointer or the is last bit
+ *
+ * \param arena the memory arena
+ * \param blk the valid block to remove from the free list
+ * \param fli the first level index of the block
+ * \param sli the second level index of the block
+ */
+static void remove_block(struct rtl_tlsf_arena *arena, tlsf_blk_hdr *blk,
+                         const RTL_UWORD *fli, const RTL_UWORD *sli) {
+  tlsf_blk_hdr *prev_blk;
+  tlsf_blk_hdr *next_blk;
+
+  assert(blk != NULL && "Current block shouldn't be null");
+  assert(blk_is_free(blk));
+
+  if (blk == NULL) return;
+
+  blk_set_busy(blk);
+
+  /*
+   * There are 4 scenarios we need to handle when we try to remove a block:
+   *
+   * - Head of the list (with next element available)
+   * - Middle of the list
+   * - Tail of the list (with prev element available)
+   * - The only one in the list
+   *
+   */
+
+  if (blk->prev_free == NULL && blk->next_free == NULL) {
+    // This is the only one in the list
+    // If we remove this one, then we have to remove the bitmap values
+
+    arena->free_blocks[(*fli) - FLI_SHIFT_VAL][*sli] = NULL;
+
+    arena->sl_bitmap[(*fli) - FLI_SHIFT_VAL] &= ~(CAST(RTL_UWORD, 1) << *sli);
+
+    if (arena->sl_bitmap[(*fli) - FLI_SHIFT_VAL] == 0U) {
+      // No more values in that sli layer, clear the fl signal
+      arena->fl_bitmap &= ~(CAST(RTL_UWORD, 1) << *fli);
+    }
+
+  } else if (blk->prev_free == NULL && blk->next_free != NULL) {
+    // Then we are at the head of the list (with elements after it)
+    next_blk = blk->next_free;
+    next_blk->prev_free = NULL;
+
+    blk->next_free = NULL;
+
+    arena->free_blocks[(*fli) - FLI_SHIFT_VAL][*sli] = next_blk;
+
+  } else if (blk->prev_free != NULL && blk->next_free == NULL) {
+    // Tail of the list (with elements before it)
+
+    prev_blk = blk->prev_free;
+
+    prev_blk->next_free = NULL;
+
+    blk->prev_free = NULL;
+    blk->next_free = NULL;
+
+  } else if (blk->prev_free != NULL && blk->next_free != NULL) {
+    // Middle of the list
+
+    prev_blk = blk->prev_free;
+    next_blk = blk->next_free;
+
+    blk->prev_free = NULL;
+    blk->next_free = NULL;
+
+    prev_blk->next_free = next_blk;
+    next_blk->prev_free = prev_blk;
+
+  } else {
+    // This should never happen
+    assert(1 == 0 && "We hit a bad remove block scenario");
+    return;
+  }
+
+  blk->next_free = NULL;
+  blk->prev_free = NULL;
+}
+
+size_t rtl_tlsf_minimum_arena_size(void) {
+  return sizeof(struct rtl_tlsf_arena) + MINIMUM_BLOCK_SIZE;
+}
+
+size_t rtl_tlsf_maximum_arena_size(void) {
+  return sizeof(struct rtl_tlsf_arena) + MAXIMUM_BLOCK_SIZE;
+}
+
+int rtl_tlsf_make_arena(struct rtl_tlsf_arena **arena, void *memory,
+                        size_t sz) {
+  int i, j;
+  struct rtl_tlsf_arena *arena_ptr;
+  tlsf_blk_hdr *blk_hdr;
+  RTL_UWORD size;
+
+  if (!safe_to_cast_to_rtl_uword(sz)) {
+    return -4;
+  }
+
+  size = (RTL_UWORD)sz;
+
+  const RTL_UWORD ARENA_SIZE = sizeof(struct rtl_tlsf_arena);
+
+  if (arena == NULL) {
+    return -1;
+  }
+
+  if (!RTL_PTR_IS_ALIGNED(memory, ALIGNMENT_REQUIREMENT)) {
+    // Memory isn't properly aligned
+    return -2;
+  }
+
+  if (size < (ARENA_SIZE + MINIMUM_BLOCK_SIZE)) {
+    // Size was too small
+    return -3;
+  }
+
+  if (size > (ARENA_SIZE + MAXIMUM_BLOCK_SIZE)) {
+    // Size was too big
+    return -4;
+  }
+
+  // Set the arena to begin at the start of the provided memory
+  *arena = CAST(struct rtl_tlsf_arena *, memory);
+
+  arena_ptr = *arena;
+
+  arena_ptr->fl_bitmap = 0;
+
+  for (i = 0; i < FLI_COUNT; i++) {
+    arena_ptr->sl_bitmap[i] = 0;
+    for (j = 0; j < SLI_COUNT; j++) {
+      arena_ptr->free_blocks[i][j] = NULL;
+    }
+  }
+
+  blk_hdr = CAST(tlsf_blk_hdr *, (unsigned char *)memory + ARENA_SIZE);
+
+  size -= ARENA_SIZE;
+
+  // We want to "round down" the size of the memory pool to a good alignment
+  size = size - (size & (ALIGNMENT_REQUIREMENT - 1));
+
+  blk_set_size(blk_hdr, size);
+  blk_hdr->prev_physical_block = NULL;
+  blk_hdr->next_free = NULL;
+  blk_hdr->prev_free = NULL;
+  blk_set_last(blk_hdr);
+
+  tlsf_arena_insert_block(arena_ptr, blk_hdr);
+
+  return 0;
+}
+
+/*!
+ * \brief find_suitable_block given a fli/sli, return a block from the free list
+ *
+ * This function will not set any bits.
+ *
+ * If no block can be found this returns NULL
+ *
+ * \param arena the memory arena
+ * \param fli the first level index to search
+ * \param sli the second level index to search
+ * \return a suitable block pointer or NULL
+ */
+static tlsf_blk_hdr *find_suitable_block(struct rtl_tlsf_arena *arena,
+                                         RTL_UWORD *fli, RTL_UWORD *sli) {
+  RTL_UWORD non_empty_fli;
+  RTL_UWORD non_empty_sli;
+  // On 16bit systems, inverting RTL_UWORD of a value of 0 will result in
+  // promotion to an integer which doesn't handle left shifting well.
+  // Recast it twice to help here
+  RTL_UWORD bitmap_tmp = arena->sl_bitmap[((*fli) - FLI_SHIFT_VAL)] &
+                         (CAST(RTL_UWORD, (~CAST(RTL_UWORD, 0))) << *sli);
+
+  // There is a 1 (aka a free block) at this fli/sli index
+  if (bitmap_tmp != 0) {
+    non_empty_fli = *fli;
+    non_empty_sli = FFS(bitmap_tmp);
+  } else {
+    // Let's look to see if there is any free block at a higher index
+    // On 16bit systems, inverting RTL_UWORD of a value of 0 will result in
+    // promotion to an integer which doesn't handle left shifting well.
+    // Recast it twice to help here
+    bitmap_tmp = arena->fl_bitmap &
+                 (CAST(RTL_UWORD, (~CAST(RTL_UWORD, 0))) << (*fli + 1));
+
+    if (bitmap_tmp == 0) {
+      // If this is zero, that means there are no free blocks at all in the
+      // higher allocations Return NULL and short circuit
+
+      return NULL;
+    }
+
+    non_empty_fli = FFS(bitmap_tmp);
+    non_empty_sli = FFS(arena->sl_bitmap[non_empty_fli - FLI_SHIFT_VAL]);
+  }
+
+  *fli = non_empty_fli;
+  *sli = non_empty_sli;
+
+  return arena->free_blocks[non_empty_fli - FLI_SHIFT_VAL][non_empty_sli];
+}
+
+/*!
+ * \brief adjust_size adjusts the parameter to fit within bounds and alignment
+ *
+ * This function will return the requested number of bytes padded to the right
+ * amount to align with the bytes on the platform.  If the request is too small
+ * or large, it will clamp the values at the appropriate min and max values.
+ *
+ * \param request the value to adjust
+ * \return the adjusted value
+ */
+static RTL_UWORD adjust_size(RTL_UWORD request) {
+  RTL_UWORD rval;
+  if (request == 0U) {
+    return 0U;
+  }
+
+  // Add any padding necessary to make this aligned in the environment
+  rval = (RTL_UWORD)(request + ALIGNMENT_REQUIREMENT - 1U) &
+         ~((RTL_UWORD)(ALIGNMENT_REQUIREMENT - 1U));
+
+  if (rval > MAXIMUM_BLOCK_SIZE) {
+    return 0U;
+  }
+
+  if (rval < MINIMUM_BLOCK_SIZE) {
+    rval = MINIMUM_BLOCK_SIZE;
+  }
+
+  return rval;
+}
+
+/*!
+ * \brief split_blk splits a block into two blocks based on the request size.
+ *
+ * Given a block (blk_hdr) and a request in bytes (r), split the block into two.
+ *
+ * blk_hdr will have a size of r and the returned block will have a size of
+ * blk_get_size(blk_hdr)-r.
+ *
+ * This function assumes that the request includes the overhead for the size
+ * and previous pointer in the blk_hdr.
+ *
+ * This function assumes that the block size of blk_hdr is bigger than
+ * r + MINIMUM_BLOCK_SIZE.
+ *
+ * This function will modify the sizes, the previous physical block pointer
+ * and the last bit of both the blk_hdr and the newly split block.
+ *
+ * This function will return a pointer to the split block (the block that
+ * comes after the supplied blk_hdr)
+ *
+ *
+ * \param blk_hdr the block to split
+ * \param r the request in bytes the block is supposed to fulfill
+ * \return a pointer to the newly split block
+ */
+static tlsf_blk_hdr *split_blk(tlsf_blk_hdr *blk_hdr, RTL_UWORD r) {
+  tlsf_blk_hdr *next_blk;
+  tlsf_blk_hdr *next_next_blk;
+  RTL_UWORD blk_size, next_blk_size;
+  RTL_UWORD blk_new_size;
+
+  // This reprsents the total block size
+  blk_size = blk_get_size(blk_hdr);
+
+  assert((r + MINIMUM_BLOCK_SIZE) <= blk_size && "Block size should be bigger");
+  assert(blk_size > 0 && "Block size shouldn't be zero");
+
+  // r includes the block overhead (START_OF_USER_DATA_OFFSET)
+  blk_new_size = r;
+  next_blk_size = blk_size - r;
+
+  assert(blk_new_size % WORD_SIZE_BYTES == 0);
+  assert(next_blk_size % WORD_SIZE_BYTES == 0);
+
+  next_blk = (tlsf_blk_hdr *)((unsigned char *)blk_hdr + blk_new_size);
+
+  blk_set_size(blk_hdr, blk_new_size);
+  blk_set_size(next_blk, next_blk_size);
+
+  next_blk->next_free = NULL;
+  next_blk->prev_free = NULL;
+  blk_set_not_last(next_blk);
+  blk_set_free(next_blk);
+
+  next_blk->prev_physical_block = blk_hdr;
+
+  assert(NEXT_BLK(blk_hdr) == next_blk);
+
+  if (blk_is_last(blk_hdr)) {
+    blk_set_last(next_blk);
+    blk_set_not_last(blk_hdr);
+  }
+  if (!blk_is_last(next_blk)) {
+    next_next_blk = NEXT_BLK(next_blk);
+    next_next_blk->prev_physical_block = next_blk;
+  }
+
+  return next_blk;
+}
+
+void *rtl_tlsf_alloc(struct rtl_tlsf_arena *arena, size_t sz) {
+  RTL_UWORD fli, sli;
+  tlsf_blk_hdr *blk_hdr;
+  tlsf_blk_hdr *remaining_blk_hdr;
+  RTL_UWORD size;
+
+  if (!safe_to_cast_to_rtl_uword(sz)) {
+    return NULL;
+  }
+
+  size = (RTL_UWORD)sz;
+
+  // We need to make sure we increase the size so that we can fit the
+  // header information of a used block
+  size = size + START_OF_USER_DATA_OFFSET;
+
+  // Adjust the block so it is within min/max sizes and aligned appropriately
+  size = adjust_size(size);
+
+  if (size == 0U) {
+    return NULL;
+  }
+
+  mapping_search(size, &fli, &sli);
+
+  // The rounding functionality of mapping_search can cause us to exceed our
+  // maximum fli.  Return here if that is the case
+  if (fli >= MAXIMUM_FLI) {
+    return NULL;
+  }
+
+  blk_hdr = find_suitable_block(arena, &fli, &sli);
+
+  if (!blk_hdr) {
+    return NULL;
+  }
+
+  assert(blk_get_size(blk_hdr) >= size && "Size needs to be larger");
+
+  // Remove the block from the arena (this also sets it to busy)
+  remove_block(arena, blk_hdr, &fli, &sli);
+
+  // If the block we got has a larger size than the actual request size,
+  // lets split it up
+  if (blk_get_size(blk_hdr) >= (size + MINIMUM_BLOCK_SIZE)) {
+    // The block was too big, we need to split it into appropriate
+    // Split_blk takes care of all meta data associated with block
+    remaining_blk_hdr = split_blk(blk_hdr, size);
+
+    assert(remaining_blk_hdr->prev_physical_block == blk_hdr && "Need linkage");
+    assert(NEXT_BLK(blk_hdr) != NULL);
+
+    tlsf_arena_insert_block(arena, remaining_blk_hdr);
+  }
+
+  return blk_hdr_to_ptr(blk_hdr);
+}
+
+static unsigned int is_prev_physical_free(const tlsf_blk_hdr *blk) {
+  if (blk->prev_physical_block == NULL) {
+    return 0U;
+  }
+
+  return blk_is_free(blk->prev_physical_block);
+}
+
+static unsigned int is_next_physical_free(const tlsf_blk_hdr *blk) {
+  tlsf_blk_hdr *next_blk;
+
+  if (blk_is_last(blk)) {
+    return 0U;
+  }
+
+  next_blk = NEXT_BLK(blk);
+
+  return blk_is_free(next_blk);
+}
+
+/*!
+ * \brief blk_merge merges two blocks together
+ *
+ * This function will merge the block "cur" into the "prev" block.
+ * Eventually returning the new "prev".
+ *
+ * This function will properly modify sizes, last physical block bits
+ * and the previous physical block pointers
+ *
+ * \param prev the block to be merged into
+ * \param cur the block to merge into prev
+ * \return a pointer to the newly merged block
+ */
+static tlsf_blk_hdr *blk_merge(tlsf_blk_hdr *prev, tlsf_blk_hdr *cur) {
+  tlsf_blk_hdr *next;
+  RTL_UWORD prev_size, cur_size;
+
+  // Increase the size of the previous block by the current blocks size
+  prev_size = blk_get_size(prev);
+  cur_size = blk_get_size(cur);
+  prev_size = prev_size + cur_size;
+
+  blk_set_size(prev, prev_size);
+
+  if (blk_is_last(cur)) {
+    blk_set_last(prev);
+    blk_set_not_last(cur);
+  }
+
+  if (!blk_is_last(prev)) {
+    next = NEXT_BLK(prev);
+    assert(next != NULL && "Next can't be null");
+    next->prev_physical_block = prev;
+  }
+
+  return prev;
+}
+
+/*!
+ * \brief merge_prev merges the supplied block with the previous physical block
+ *
+ * This function will take a free block and merge it with its previous physical
+ * block if the previous physical block is free.
+ *
+ * It will then return a pointer to the merged block
+ *
+ * \param arena the memory arena
+ * \param blk the block to merge
+ * \return a pointer to the merged block
+ */
+static tlsf_blk_hdr *merge_prev(struct rtl_tlsf_arena *arena,
+                                tlsf_blk_hdr *blk) {
+  tlsf_blk_hdr *prev_blk;
+  RTL_UWORD fli, sli;
+
+  assert(blk_is_free(blk) && "Current block must be free");
+
+  if (is_prev_physical_free(blk)) {
+    prev_blk = blk->prev_physical_block;
+
+    assert(prev_blk != NULL && "Previous block can't be null");
+    assert(blk_is_free(prev_blk) && "Previous block must be free");
+
+    // Find the fli and sli indexes, no rounding
+    mapping_insert(blk_get_size(prev_blk), &fli, &sli);
+
+    // Remove block sets the busy bit...need to undo that
+    remove_block(arena, prev_blk, &fli, &sli);
+    blk_set_free(prev_blk);
+    blk = blk_merge(prev_blk, blk);
+  }
+
+  return blk;
+}
+
+/*!
+ * \brief merge_next merges the supplied block with the next physical block
+ *
+ * This function will take a free block and merge it with its next physical
+ * block if the next physical block is free.
+ *
+ * It will then return a pointer to the merged block
+ *
+ * \param arena the memory arena
+ * \param blk the block to merge
+ * \return a pointer to the merged block
+ */
+static tlsf_blk_hdr *merge_next(struct rtl_tlsf_arena *arena,
+                                tlsf_blk_hdr *blk) {
+  tlsf_blk_hdr *next_blk;
+  RTL_UWORD fli, sli;
+
+  assert(blk_is_free(blk) && "Current block must be free");
+
+  if (is_next_physical_free(blk)) {
+    next_blk = NEXT_BLK(blk);
+    assert(next_blk != NULL && "Next block can't be null");
+    assert(blk_is_free(next_blk) && "Next block must be free");
+
+    // Find the fli and sli indexes, no rounding
+    mapping_insert(blk_get_size(next_blk), &fli, &sli);
+
+    // Remove block sets the busy bit...need to undo that
+    remove_block(arena, next_blk, &fli, &sli);
+    blk_set_free(next_blk);
+    blk = blk_merge(blk, next_blk);
+  }
+
+  return blk;
+}
+
+void rtl_tlsf_free(struct rtl_tlsf_arena *arena, void *ptr) {
+  tlsf_blk_hdr *blk;
+
+  // Don't free NULL
+  if (ptr == NULL) {
+    return;
+  }
+
+  blk = ptr_to_blk_hdr(ptr);
+
+  assert(!blk_is_free(blk) && "Double free occurred!");
+
+  blk_set_free(blk);
+
+  blk = merge_prev(arena, blk);
+
+  blk = merge_next(arena, blk);
+
+  tlsf_arena_insert_block(arena, blk);
+}
